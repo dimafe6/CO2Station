@@ -5,7 +5,6 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-#include <AmperkaFET.h>
 #include <ArduinoJson.h>
 #include <SimpleTimer.h>
 #include <WiFiClientSecure.h>
@@ -15,8 +14,10 @@
 
 #define MH_Z19_RX 2
 #define MH_Z19_TX 16
-#define BOZZER_REGISTER 4
-#define SHIFT_CS 15
+#define BOZZER 14
+#define LED_R 13
+#define LED_G 15
+#define LED_B 12
 
 #define WIFI_CONNECTION_TIMEOUT 10
 #define CHECK_WIFI_INTERVAL 2000
@@ -29,7 +30,6 @@
 
 Adafruit_SSD1306 display(-1);
 MHZ co2(MH_Z19_RX, MH_Z19_TX, 1, MHZ19B);
-FET shift(SHIFT_CS);
 WiFiClient client;
 WiFiClientSecure sslClient;
 UniversalTelegramBot bot(BOTtoken, sslClient);
@@ -67,6 +67,39 @@ Weather weatherData;
 void setup()
 {
   pinMode(0, INPUT_PULLUP);
+  pinMode(LED_R, OUTPUT);
+  pinMode(LED_G, OUTPUT);
+  pinMode(LED_B, OUTPUT);
+  pinMode(BOZZER, OUTPUT);
+
+  for (int u = 0; u < 1024; u++)
+  {
+    analogWrite(LED_G, u);
+    delayMicroseconds(100);
+  }
+
+  for (int u = 1024; u >= 0; u--)
+  {
+    analogWrite(LED_B, u);
+    delayMicroseconds(100);
+  }
+
+  for (int u = 0; u < 1024; u++)
+  {
+    analogWrite(LED_R, u);
+    delayMicroseconds(100);
+  }
+
+  for (int u = 1024; u >= 0; u--)
+  {
+    analogWrite(LED_G, u);
+    delayMicroseconds(100);
+  }
+
+  analogWrite(LED_R, 0);
+  analogWrite(LED_G, 0);
+  analogWrite(LED_B, 0);
+
   attachInterrupt(digitalPinToInterrupt(0), handleButton, FALLING);
 
   oledPages[0] = displayCO2;
@@ -77,8 +110,6 @@ void setup()
   oledPages[5] = displayWeatherWind;
 
   Serial.begin(9600);
-
-  shift.begin();
 
   display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
 
@@ -91,7 +122,7 @@ void setup()
 
   display.clearDisplay();
   display.setTextColor(WHITE);
-  
+
   //display.fillRect(0, 0,10,32, WHITE );
   //display.display();
 
@@ -296,9 +327,9 @@ void beep(int duration, int pause, int beepsCount)
   for (i = 0; i < beepsCount; i++)
   {
     delay(pause);
-    shift.digitalWrite(BOZZER_REGISTER, HIGH);
+    digitalWrite(BOZZER, HIGH);
     delay(duration);
-    shift.digitalWrite(BOZZER_REGISTER, LOW);
+    digitalWrite(BOZZER, LOW);
   }
 }
 
@@ -399,10 +430,10 @@ void displayWeatherHumidity()
   display.print("Outside");
   display.setTextSize(3);
   display.setCursor(46, 12);
-  display.print(weatherData.humidity);  
+  display.print(weatherData.humidity);
   display.setTextSize(2);
   display.setCursor(104, 12);
-  display.print("%");  
+  display.print("%");
   display.display();
 }
 
@@ -415,6 +446,6 @@ void displayWeatherWind()
   display.print("Outside");
   display.setTextSize(3);
   display.setCursor(46, 12);
-  display.print(String(weatherData.wind, 1));  
+  display.print(String(weatherData.wind, 1));
   display.display();
 }
