@@ -33,7 +33,7 @@ WiFiClientSecure sslClient;
 UniversalTelegramBot bot(BOTtoken, sslClient);
 SimpleTimer timer;
 
-int co2History[100];
+int co2History[100] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
 int wiFiTimer;
 int sensorTimer;
 int oledTimer;
@@ -151,7 +151,7 @@ void blinkLEDOnStartup()
 int getMin(int *a, int size)
 {
   int minimum = a[0];
-  for (int i = 0; i < size; i++)
+  for (int i = 1; i < size; i++)
   {
     if (a[i] < minimum)
       minimum = a[i];
@@ -162,7 +162,7 @@ int getMin(int *a, int size)
 int getMax(int *a, int size)
 {
   int maximum = a[0];
-  for (int i = 0; i < size; i++)
+  for (int i = 1; i < size; i++)
   {
     if (a[i] > maximum)
       maximum = a[i];
