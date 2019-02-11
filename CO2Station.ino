@@ -6,8 +6,6 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <SimpleTimer.h>
-#include <WiFiClientSecure.h>
-#include <UniversalTelegramBot.h>
 #include "icons.h"
 #include "secrets.h"
 
@@ -18,35 +16,28 @@
 #define LED_G 15
 #define LED_B 12
 
-#define WIFI_CONNECTION_TIMEOUT 10
-#define CHECK_WIFI_INTERVAL 2000
-#define SMART_CONFIG_TIMEOUT 300
+#define WIFI_CONNECTION_TIMEOUT 5
 #define OLED_PAGE_INTERVAL 5000
-#define OLED_PAGES 3
-#define READ_SENSOR_INTERVAL 6000
-#define TELEGRAM_BOT_INTERVAL 5000 // Mean time between scan messages
+#define OLED_PAGES 2
+#define READ_SENSOR_INTERVAL 5000
 
 Adafruit_SSD1306 display(-1);
 MHZ co2(MH_Z19_RX, MH_Z19_TX, 1, MHZ19B);
 WiFiClient client;
-WiFiClientSecure sslClient;
-UniversalTelegramBot bot(BOTtoken, sslClient);
 SimpleTimer timer;
 
-int co2History[100] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
-int wiFiTimer;
+int co2History[100];
 int sensorTimer;
+int smartConfigLEDTimer;
+bool smartConfigLEDState = false;
 int oledTimer;
-int telegramTimer;
 bool smartConfigRun = false;
 unsigned int wifiConnectionTime = 0;
-unsigned int smartConfigTime = 0;
 void (*oledPages[OLED_PAGES])();
 int currentOLEDPage = 0;
 volatile bool buttonPressed = false;
 volatile long lastButtonPressedMillis;
 int ppm = 0;
-int temp = 0;
 
 void setup()
 {
@@ -57,23 +48,27 @@ void setup()
   pinMode(LED_G, OUTPUT);
   pinMode(LED_B, OUTPUT);
   pinMode(BOZZER, OUTPUT);
+  
+  smartConfigLEDTimer = timer.setInterval(1000, smartConfigLED);
+  timer.disable(smartConfigLEDTimer);
 
-  analogWrite(LED_R, 0);
-  analogWrite(LED_G, 0);
-  analogWrite(LED_B, 0);
+  WiFi.disconnect(true);
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
+  WiFi.onEvent(WiFiEvent);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin();
+  if(WiFi.SSID() == "") {
+    startSmartConfig();
+  }
 
   blinkLEDOnStartup();
 
   attachInterrupt(digitalPinToInterrupt(0), handleButton, FALLING);
 
   oledPages[0] = displayCO2;
-  oledPages[1] = displayTemperature;
-  oledPages[2] = displayCo2Plot;
+  oledPages[1] = displayCo2Plot;
 
   display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
-
-  WiFi.mode(WIFI_STA);
-  WiFi.begin();
 
 #ifdef CO2_DEBUG
   co2.setDebug(true);
@@ -96,13 +91,13 @@ void setup()
 
     readSensor();
 
+    changeOledPage();
+
     beep(50, 100, 2);
   }
 
-  wiFiTimer = timer.setInterval(CHECK_WIFI_INTERVAL, checkWiFi);
   sensorTimer = timer.setInterval(READ_SENSOR_INTERVAL, readSensor);
   oledTimer = timer.setInterval(OLED_PAGE_INTERVAL, changeOledPage);
-  telegramTimer = timer.setInterval(TELEGRAM_BOT_INTERVAL, telegramGetUpdates);
 }
 
 void loop()
@@ -121,8 +116,51 @@ void loop()
   }
 }
 
+void WiFiEvent(WiFiEvent_t event)
+{
+  Serial.printf("[WiFi-event] event: %d\n", event);
+
+  switch (event)
+  {
+  case WIFI_EVENT_STAMODE_DISCONNECTED:
+    wifiConnectionTime++;
+    if (wifiConnectionTime > WIFI_CONNECTION_TIMEOUT)
+    {
+      startSmartConfig();
+      wifiConnectionTime = 0;
+    }
+    break;
+  case WIFI_EVENT_STAMODE_GOT_IP:
+    Serial.println("Got IP");
+    wifiConnectionTime = 0;
+    timer.disable(smartConfigLEDTimer);
+    analogWrite(LED_B, 0);
+    break;
+  }
+}
+
+void startSmartConfig()
+{
+  Serial.println("Smart config running");
+  WiFi.beginSmartConfig();
+  smartConfigRun = true;
+  timer.enable(smartConfigLEDTimer);
+}
+
+void smartConfigLED()
+{
+  smartConfigLEDState = !smartConfigLEDState;
+  analogWrite(LED_G, 0);
+  analogWrite(LED_R, 0);
+  analogWrite(LED_B, smartConfigLEDState ? 1024 : 0);
+}
+
 void blinkLEDOnStartup()
 {
+  analogWrite(LED_R, 0);
+  analogWrite(LED_G, 0);
+  analogWrite(LED_B, 0);
+
   for (int u = 0; u < 1024; u++)
   {
     analogWrite(LED_G, u);
@@ -146,6 +184,10 @@ void blinkLEDOnStartup()
     analogWrite(LED_G, u);
     delayMicroseconds(100);
   }
+
+  analogWrite(LED_R, 0);
+  analogWrite(LED_G, 0);
+  analogWrite(LED_B, 0);
 }
 
 int getMin(int *a, int size)
@@ -177,26 +219,6 @@ void handleButton()
   lastButtonPressedMillis = millis();
 }
 
-void telegramGetUpdates()
-{
-  if (WiFi.status() != WL_CONNECTED)
-  {
-    return;
-  }
-
-  int numNewMessages = 0;
-  do
-  {
-    numNewMessages = bot.getUpdates(bot.last_message_received + 1);
-
-    for (int i = 0; i < numNewMessages; i++)
-    {
-      bot.sendMessage(bot.messages[i].chat_id, bot.messages[i].text, "");
-      numNewMessages--;
-    }
-  } while (numNewMessages);
-}
-
 void changeOledPage()
 {
   currentOLEDPage++;
@@ -211,59 +233,19 @@ void changeOledPage()
 
 void readSensor()
 {
-  ppm = co2.readCO2UART();
-  temp = co2.getLastTemperature();
+
+  do
+  {
+    ppm = co2.readCO2UART();
+    delay(10);
+  } while (ppm <= 0);
 
   for (byte i = 0; i < 99; i++)
   {
     co2History[i] = co2History[i + 1];
   }
+
   co2History[99] = ppm;
-
-  for (byte i = 0; i < 100; i++)
-  {
-    Serial.print(co2History[i]);
-    Serial.print(",");
-  }
-  Serial.println();
-}
-
-void checkWiFi()
-{
-  if (WiFi.status() == WL_CONNECTED)
-  {
-    //Serial.println("WiFi connected!!!");
-    wifiConnectionTime = 0;
-    smartConfigRun = false;
-    WiFi.stopSmartConfig();
-  }
-  else
-  {
-    if (!smartConfigRun)
-    {
-      //Serial.println("WiFi disconnected!!!");
-      wifiConnectionTime++;
-      if (wifiConnectionTime > WIFI_CONNECTION_TIMEOUT)
-      {
-        Serial.println("Smart config for 5 miutes");
-        WiFi.beginSmartConfig();
-        smartConfigRun = true;
-        wifiConnectionTime = 0;
-      }
-    }
-    else
-    {
-      smartConfigTime++;
-      if (smartConfigTime > 60 && smartConfigRun)
-      {
-        WiFi.stopSmartConfig();
-        WiFi.reconnect();
-        smartConfigTime = 0;
-        smartConfigRun = false;
-        wifiConnectionTime = 0;
-      }
-    }
-  }
 }
 
 void beep(int duration, int pause, int beepsCount)
@@ -322,20 +304,6 @@ void displayCO2()
   display.setTextSize(3);
   display.setCursor(46, 12);
   display.print(ppm);
-  display.display();
-}
-
-void displayTemperature()
-{
-  display.clearDisplay();
-  display.drawBitmap(0, 0, term_icon, 9, 32, 1);
-  display.setTextSize(1);
-  display.setCursor(48, 0);
-  display.print("Internal");
-  display.setTextSize(3);
-  display.setCursor(46, 12);
-  display.print(temp);
-  display.drawBitmap(100, 12, celsius_icon, 16, 16, 1);
   display.display();
 }
 
