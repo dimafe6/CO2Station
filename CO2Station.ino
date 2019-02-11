@@ -5,12 +5,10 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-#include <ArduinoJson.h>
+#include <WeatherLib.h>
 #include <SimpleTimer.h>
 #include <WiFiClientSecure.h>
 #include <UniversalTelegramBot.h>
-#include <NTPClient.h>
-#include <WiFiUdp.h>
 #include "icons.h"
 #include "secrets.h"
 
@@ -21,56 +19,47 @@
 #define LED_G 15
 #define LED_B 12
 
-#define WIFI_CONNECTION_TIMEOUT 10
+#define WIFI_CONNECTION_TIMEOUT 10 //Seconds
+#define SMART_CONFIG_TIMEOUT 300 // Seconds
 #define CHECK_WIFI_INTERVAL 2000
-#define SMART_CONFIG_TIMEOUT 300
 #define OLED_PAGE_INTERVAL 5000
-#define OLED_PAGES 8
+#define OLED_PAGES 7
 #define READ_SENSOR_INTERVAL 6000
 #define UPDATE_WEATHER_INTERVAL 300000 // 5 minutes
 #define TELEGRAM_BOT_INTERVAL 5000     // Mean time between scan messages
 
-WiFiUDP ntpUDP;
-NTPClient timeClient(ntpUDP);
 Adafruit_SSD1306 display(-1);
 MHZ co2(MH_Z19_RX, MH_Z19_TX, 1, MHZ19B);
 WiFiClient client;
 WiFiClientSecure sslClient;
 UniversalTelegramBot bot(BOTtoken, sslClient);
 SimpleTimer timer;
-StaticJsonBuffer<2000> weatherBuffer;
+WeatherLib wl("Kiev,UA", "0d05fb0926034f4a849664441742cf69");
 
-int co2History[100];
-int wiFiTimer;
-int sensorTimer;
-int oledTimer;
-int weatherTimer;
-int telegramTimer;
+unsigned int co2History[100];
+byte wiFiTimer;
+byte sensorTimer;
+byte oledTimer;
+byte weatherTimer;
+byte telegramTimer;
 bool smartConfigRun = false;
 unsigned int wifiConnectionTime = 0;
 unsigned int smartConfigTime = 0;
-void (*oledPages[OLED_PAGES])();
-int currentOLEDPage = 0;
+bool (*oledPages[OLED_PAGES])();
+byte currentOLEDPage = 0;
 volatile bool buttonPressed = false;
 volatile long lastButtonPressedMillis;
-int ppm = 0;
+unsigned int ppm = 0;
 int temp = 0;
-bool weatherUpdated = false;
-bool ntpBegin = false;
 
-struct Weather
-{
-  String city;
-  float temp;
-  int pressure;
-  int humidity;
-  float wind;
-};
-
-Weather weatherData;
+weatherSt *weatherData;
 
 void setup()
 {
+  Serial.begin(9600);
+
+  Serial.println("Starting...");
+
   pinMode(0, INPUT_PULLUP);
   pinMode(LED_R, OUTPUT);
   pinMode(LED_G, OUTPUT);
@@ -113,10 +102,7 @@ void setup()
   oledPages[3] = displayWeatherPressure;
   oledPages[4] = displayWeatherHumidity;
   oledPages[5] = displayWeatherWind;
-  oledPages[6] = displayTime;
-  oledPages[7] = displayCo2Plot;
-
-  Serial.begin(9600);
+  oledPages[6] = displayCo2Plot;
 
   display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
 
@@ -132,7 +118,7 @@ void setup()
 
   if (co2.isPreHeating())
   {
-    Serial.print("Preheating");
+    Serial.println("Preheating");
 
     beep(70, 100, 1);
 
@@ -144,18 +130,23 @@ void setup()
 
     readSensor();
 
-    display.clearDisplay();
-    display.setTextSize(2);
-    display.setTextColor(WHITE);
-    display.setCursor(20, 0);
-    display.print("Updating");
-    display.setCursor(27, 18);
-    display.print("weather");
-    display.display();
+    if (WiFi.status() == WL_CONNECTED)
+    {
+      display.clearDisplay();
+      display.setTextSize(2);
+      display.setTextColor(WHITE);
+      display.setCursor(20, 0);
+      display.print("Updating");
+      display.setCursor(27, 18);
+      display.print("weather");
+      display.display();
 
-    updateWeather();
+      updateWeather();
+    }
 
     beep(50, 100, 2);
+
+    changeOledPage();
   }
 
   wiFiTimer = timer.setInterval(CHECK_WIFI_INTERVAL, checkWiFi);
@@ -167,8 +158,6 @@ void setup()
 
 void loop()
 {
-  timeClient.update();
-
   timer.run();
   if (buttonPressed)
   {
@@ -183,7 +172,7 @@ void loop()
   }
 }
 
-int getMin(int *a, int size)
+int getMin(unsigned int *a, int size)
 {
   int minimum = a[0];
   for (int i = 0; i < size; i++)
@@ -194,7 +183,7 @@ int getMin(int *a, int size)
   return minimum;
 }
 
-int getMax(int *a, int size)
+int getMax(unsigned int *a, int size)
 {
   int maximum = a[0];
   for (int i = 0; i < size; i++)
@@ -236,87 +225,29 @@ void updateWeather()
 {
   if (WiFi.status() != WL_CONNECTED)
   {
-    weatherUpdated = false;
     return;
   }
 
-  if (!client.connect("api.openweathermap.org", 80))
-  {
-    Serial.println("connection failed");
-    weatherUpdated = false;
-    return;
-  }
+  Serial.println("Updating weather");
 
-  Serial.println("Update weather");
+  weatherData = wl.getWeather();
 
-  client.println("GET /data/2.5/weather?id=703448&appid=0d05fb0926034f4a849664441742cf69 HTTP/1.1");
-  client.println("Host: api.openweathermap.org");
-  client.println("Connection: close");
-  client.println();
-
-  // wait for data to be available
-  unsigned long timeout = millis();
-  while (client.available() == 0)
-  {
-    yield();
-    if (millis() - timeout > 5000)
-    {
-      Serial.println(">>> Client Timeout !");
-      client.stop();
-      weatherUpdated = false;
-      return;
-    }
-  }
-
-  String line;
-  while (client.available())
-  {
-    line = client.readStringUntil('\r');
-  }
-
-  if (line.length() > 0)
-  {
-    Serial.println(line);
-    JsonObject &root = weatherBuffer.parseObject(line);
-    if (root.success())
-    {
-      String city = root["name"];
-      weatherData.city = city;
-      float tempK = root["main"]["temp"];
-      float tempC = tempK - 273.15;
-      weatherData.temp = tempC;
-      int pressurehPa = root["main"]["pressure"];
-      weatherData.pressure = pressurehPa / 1.333;
-      weatherData.humidity = root["main"]["humidity"];
-      weatherData.wind = root["wind"]["speed"];
-
-      weatherUpdated = true;
-    }
-    else
-    {
-      Serial.println("parseObject() failed");
-      weatherUpdated = false;
-    }
-  }
+  Serial.println("Weather updated");
 }
 
 void changeOledPage()
 {
   currentOLEDPage++;
 
-  //Skip weather pages if weather is not updated
-  if (!weatherUpdated && currentOLEDPage >= 2 && currentOLEDPage <= 5)
-  {
-    currentOLEDPage = 6;
-    return;
-  }
-
   if (currentOLEDPage >= OLED_PAGES)
   {
     currentOLEDPage = 0;
   }
 
-  oledPages[currentOLEDPage]();
+  if (!oledPages[currentOLEDPage]())
+  {
+    changeOledPage();
+  }
 }
 
 void readSensor()
@@ -346,25 +277,16 @@ void checkWiFi()
     wifiConnectionTime = 0;
     smartConfigRun = false;
     WiFi.stopSmartConfig();
-
-    if (!ntpBegin)
-    {
-      timeClient.begin();
-      timeClient.setTimeOffset(7200);
-      ntpBegin = true;
-    }
   }
   else
   {
-    ntpBegin = false;
-
     if (!smartConfigRun)
     {
       //Serial.println("WiFi disconnected!!!");
-      wifiConnectionTime++;
-      if (wifiConnectionTime > WIFI_CONNECTION_TIMEOUT)
+      wifiConnectionTime += CHECK_WIFI_INTERVAL;
+      if (wifiConnectionTime > WIFI_CONNECTION_TIMEOUT * 1000)
       {
-        Serial.println("Smart config for 5 miutes");
+        Serial.println("Start smart config");
         WiFi.beginSmartConfig();
         smartConfigRun = true;
         wifiConnectionTime = 0;
@@ -372,8 +294,8 @@ void checkWiFi()
     }
     else
     {
-      smartConfigTime++;
-      if (smartConfigTime > 60 && smartConfigRun)
+      smartConfigTime += CHECK_WIFI_INTERVAL;
+      if ((smartConfigTime > SMART_CONFIG_TIMEOUT * 1000) && smartConfigRun)
       {
         WiFi.stopSmartConfig();
         WiFi.reconnect();
@@ -406,23 +328,6 @@ void secondsToMS(const uint32_t seconds, uint8_t &m, uint8_t &s)
   t = (t - m) / 60;
 }
 
-bool isTimeSynced()
-{
-  timeClient.getEpochTime() > 0;
-}
-
-String getFormattedTime()
-{
-  unsigned long rawTime = timeClient.getEpochTime();
-  unsigned long hours = (rawTime % 86400L) / 3600;
-  String hoursStr = hours < 10 ? "0" + String(hours) : String(hours);
-
-  unsigned long minutes = (rawTime % 3600) / 60;
-  String minuteStr = minutes < 10 ? "0" + String(minutes) : String(minutes);
-
-  return hoursStr + ":" + minuteStr;
-}
-
 void displayPreheat()
 {
   uint8_t preheadElapsedSeconds = 180 - (millis() / 1000);
@@ -448,7 +353,7 @@ void displayPreheat()
   display.display();
 }
 
-void displayCO2()
+bool displayCO2()
 {
   display.clearDisplay();
   display.drawBitmap(0, 0, co2_icon, 32, 32, 1);
@@ -459,9 +364,11 @@ void displayCO2()
   display.setCursor(46, 12);
   display.print(ppm);
   display.display();
+
+  return true;
 }
 
-void displayTemperature()
+bool displayTemperature()
 {
   display.clearDisplay();
   display.drawBitmap(0, 0, term_icon, 9, 32, 1);
@@ -473,10 +380,17 @@ void displayTemperature()
   display.print(temp);
   display.drawBitmap(100, 12, celsius_icon, 16, 16, 1);
   display.display();
+
+  return true;
 }
 
-void displayWeatherTemp()
+bool displayWeatherTemp()
 {
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    return false;
+  }
+
   display.clearDisplay();
   display.drawBitmap(0, 0, term_icon, 9, 32, 1);
   display.setTextSize(1);
@@ -484,13 +398,20 @@ void displayWeatherTemp()
   display.print("Outside");
   display.setTextSize(3);
   display.setCursor(46, 12);
-  display.print(String(weatherData.temp, 0));
+  display.print(weatherData->temp);
   display.drawBitmap(100, 12, celsius_icon, 16, 16, 1);
   display.display();
+
+  return true;
 }
 
-void displayWeatherPressure()
+bool displayWeatherPressure()
 {
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    return false;
+  }
+
   display.clearDisplay();
   display.drawBitmap(0, 0, atm_pressure_icon, 20, 32, 1);
   display.setTextSize(1);
@@ -498,12 +419,19 @@ void displayWeatherPressure()
   display.print("Outside");
   display.setTextSize(3);
   display.setCursor(46, 12);
-  display.print(weatherData.pressure);
+  display.print(weatherData->pressure);
   display.display();
+
+  return true;
 }
 
-void displayWeatherHumidity()
+bool displayWeatherHumidity()
 {
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    return false;
+  }
+
   display.clearDisplay();
   display.drawBitmap(0, 0, humidity_icon, 28, 32, 1);
   display.setTextSize(1);
@@ -511,15 +439,22 @@ void displayWeatherHumidity()
   display.print("Outside");
   display.setTextSize(3);
   display.setCursor(46, 12);
-  display.print(weatherData.humidity);
+  display.print(weatherData->humidity);
   display.setTextSize(2);
   display.setCursor(104, 12);
   display.print("%");
   display.display();
+
+  return true;
 }
 
-void displayWeatherWind()
+bool displayWeatherWind()
 {
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    return false;
+  }
+
   display.clearDisplay();
   display.drawBitmap(0, 0, wind_icon, 32, 32, 1);
   display.setTextSize(1);
@@ -527,20 +462,13 @@ void displayWeatherWind()
   display.print("Outside");
   display.setTextSize(3);
   display.setCursor(46, 12);
-  display.print(String(weatherData.wind, 1));
+  display.print(weatherData->wind_speed);
   display.display();
+
+  return true;
 }
 
-void displayTime()
-{
-  display.clearDisplay();
-  display.setTextSize(3);
-  display.setCursor(20, 10);
-  display.print(getFormattedTime());
-  display.display();
-}
-
-void displayCo2Plot()
+bool displayCo2Plot()
 {
   int minimum = getMin(co2History, 100);
   minimum = minimum > 0 ? minimum : 1;
@@ -563,8 +491,10 @@ void displayCo2Plot()
   for (byte i = 0; i < 100; i++)
   {
     int height = (co2History[i] * 22) / maximum;
-    display.drawFastVLine(i, 32-height, height, WHITE);
+    display.drawFastVLine(i, 32 - height, height, WHITE);
   }
 
   display.display();
+
+  return true;
 }
