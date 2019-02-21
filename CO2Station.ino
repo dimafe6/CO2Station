@@ -6,6 +6,9 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <SimpleTimer.h>
+#include <ESP8266mDNS.h>
+#include <WiFiUdp.h>
+#include <ArduinoOTA.h>
 #include "icons.h"
 #include "secrets.h"
 
@@ -52,14 +55,10 @@ void setup()
   smartConfigLEDTimer = timer.setInterval(1000, smartConfigLED);
   timer.disable(smartConfigLEDTimer);
 
-  WiFi.disconnect(true);
   WiFi.setSleepMode(WIFI_NONE_SLEEP);
   WiFi.onEvent(WiFiEvent);
   WiFi.mode(WIFI_STA);
   WiFi.begin();
-  if(WiFi.SSID() == "") {
-    startSmartConfig();
-  }
 
   blinkLEDOnStartup();
 
@@ -96,12 +95,18 @@ void setup()
     beep(50, 100, 2);
   }
 
+  if(WiFi.SSID() == "") {
+    startSmartConfig();
+  }
+
   sensorTimer = timer.setInterval(READ_SENSOR_INTERVAL, readSensor);
   oledTimer = timer.setInterval(OLED_PAGE_INTERVAL, changeOledPage);
 }
 
 void loop()
 {
+  ArduinoOTA.handle();
+
   timer.run();
   if (buttonPressed)
   {
@@ -132,9 +137,11 @@ void WiFiEvent(WiFiEvent_t event)
     break;
   case WIFI_EVENT_STAMODE_GOT_IP:
     Serial.println("Got IP");
+    Serial.println(WiFi.localIP());
     wifiConnectionTime = 0;
     timer.disable(smartConfigLEDTimer);
     analogWrite(LED_B, 0);
+    ArduinoOTA.begin();
     break;
   }
 }
@@ -233,12 +240,13 @@ void changeOledPage()
 
 void readSensor()
 {
-
+  byte attempts = 10;
   do
   {
     ppm = co2.readCO2UART();
+    attempts--;
     delay(10);
-  } while (ppm <= 0);
+  } while (ppm <= 0 && attempts>0);
 
   for (byte i = 0; i < 99; i++)
   {
