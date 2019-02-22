@@ -1,16 +1,18 @@
 #include <ESP8266WiFi.h>
-#include <SoftwareSerial.h>
 #include "MHZ.h"
-#include <SPI.h>
-#include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <SimpleTimer.h>
-#include <ESP8266mDNS.h>
-#include <WiFiUdp.h>
 #include <ArduinoOTA.h>
+#include <ArduinoJson.h>
+#include <WiFiUdp.h>
+#include <NTPClient.h>
+#include "FS.h"
+#include "helper.h"
 #include "icons.h"
 #include "secrets.h"
+
+#define DEBUG
 
 #define MH_Z19_RX 2
 #define MH_Z19_TX 16
@@ -24,6 +26,11 @@
 #define OLED_PAGES 2
 #define READ_SENSOR_INTERVAL 5000
 
+#define OLED_PAGE_CO2_VALUE 0
+#define OLED_PAGE_CO2_10_MIN_CHART 1
+
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP); //TODO: change NTP server to pool.ntp.org
 Adafruit_SSD1306 display(-1);
 MHZ co2(MH_Z19_RX, MH_Z19_TX, 1, MHZ19B);
 WiFiClient client;
@@ -31,27 +38,32 @@ SimpleTimer timer;
 
 int co2History[100];
 int sensorTimer;
+int preheatTimer;
 int smartConfigLEDTimer;
 bool smartConfigLEDState = false;
 int oledTimer;
 bool smartConfigRun = false;
 unsigned int wifiConnectionTime = 0;
 void (*oledPages[OLED_PAGES])();
-int currentOLEDPage = 0;
+byte currentOLEDPage = 0;
 volatile bool buttonPressed = false;
 volatile long lastButtonPressedMillis;
 int ppm = 0;
 
 void setup()
 {
+#ifdef DEBUG
   Serial.begin(9600);
+#endif
+
+  SPIFFS.begin();
 
   pinMode(0, INPUT_PULLUP);
   pinMode(LED_R, OUTPUT);
   pinMode(LED_G, OUTPUT);
   pinMode(LED_B, OUTPUT);
   pinMode(BOZZER, OUTPUT);
-  
+
   smartConfigLEDTimer = timer.setInterval(1000, smartConfigLED);
   timer.disable(smartConfigLEDTimer);
 
@@ -60,59 +72,43 @@ void setup()
   WiFi.mode(WIFI_STA);
   WiFi.begin();
 
+  if (WiFi.SSID() == "")
+  {
+    startSmartConfig();
+  }
+
   blinkLEDOnStartup();
 
   attachInterrupt(digitalPinToInterrupt(0), handleButton, FALLING);
 
-  oledPages[0] = displayCO2;
-  oledPages[1] = displayCo2Plot;
+  initOledPages();
 
   display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  display.clearDisplay();
+  display.setTextColor(WHITE);
 
 #ifdef CO2_DEBUG
   co2.setDebug(true);
 #endif
 
-  display.clearDisplay();
-  display.setTextColor(WHITE);
-
-  if (co2.isPreHeating())
-  {
-    Serial.print("Preheating");
-
-    beep(70, 100, 1);
-
-    while (co2.isPreHeating())
-    {
-      delay(1000);
-      displayPreheat();
-    }
-
-    readSensor();
-
-    changeOledPage();
-
-    beep(50, 100, 2);
-  }
-
-  if(WiFi.SSID() == "") {
-    startSmartConfig();
-  }
-
+  preheatTimer = timer.setInterval(1000, checkPreheat);
   sensorTimer = timer.setInterval(READ_SENSOR_INTERVAL, readSensor);
-  oledTimer = timer.setInterval(OLED_PAGE_INTERVAL, changeOledPage);
+  oledTimer = timer.setInterval(OLED_PAGE_INTERVAL, showNextOledPage);
 }
 
 void loop()
 {
   ArduinoOTA.handle();
 
+  timeClient.update();
+
   timer.run();
+
   if (buttonPressed)
   {
     buttonPressed = false;
     timer.disable(oledTimer);
-    changeOledPage();
+    showNextOledPage();
   }
 
   if (millis() - lastButtonPressedMillis > 10000)
@@ -121,10 +117,38 @@ void loop()
   }
 }
 
+void initOledPages()
+{
+  oledPages[OLED_PAGE_CO2_VALUE] = displayCO2;
+  oledPages[OLED_PAGE_CO2_10_MIN_CHART] = displayCo2Plot;
+}
+
+void checkPreheat()
+{
+  if (co2.isPreHeating())
+  {
+#ifdef DEBUG
+    Serial.print("Preheating...");
+#endif
+    displayPreheat();
+  }
+  else
+  {
+    timer.disable(preheatTimer);
+
+    readSensor();
+
+    showOledPage(OLED_PAGE_CO2_VALUE);
+
+    beep(50, 100, 2, BOZZER);
+  }
+}
+
 void WiFiEvent(WiFiEvent_t event)
 {
+#ifdef DEBUG
   Serial.printf("[WiFi-event] event: %d\n", event);
-
+#endif
   switch (event)
   {
   case WIFI_EVENT_STAMODE_DISCONNECTED:
@@ -136,11 +160,15 @@ void WiFiEvent(WiFiEvent_t event)
     }
     break;
   case WIFI_EVENT_STAMODE_GOT_IP:
+#ifdef DEBUG
     Serial.println("Got IP");
     Serial.println(WiFi.localIP());
-    wifiConnectionTime = 0;
-    timer.disable(smartConfigLEDTimer);
-    analogWrite(LED_B, 0);
+#endif
+    wifiConnectionTime = 0;   
+    timer.disable(smartConfigLEDTimer);    
+    analogWrite(LED_B, 0);    
+    timeClient.begin();
+    timeClient.setTimeOffset(7200);
     ArduinoOTA.begin();
     break;
   }
@@ -148,7 +176,9 @@ void WiFiEvent(WiFiEvent_t event)
 
 void startSmartConfig()
 {
+#ifdef DEBUG
   Serial.println("Smart config running");
+#endif
   WiFi.beginSmartConfig();
   smartConfigRun = true;
   timer.enable(smartConfigLEDTimer);
@@ -197,45 +227,28 @@ void blinkLEDOnStartup()
   analogWrite(LED_B, 0);
 }
 
-int getMin(int *a, int size)
-{
-  int minimum = a[0];
-  for (int i = 1; i < size; i++)
-  {
-    if (a[i] < minimum)
-      minimum = a[i];
-  }
-  return minimum;
-}
-
-int getMax(int *a, int size)
-{
-  int maximum = a[0];
-  for (int i = 1; i < size; i++)
-  {
-    if (a[i] > maximum)
-      maximum = a[i];
-  }
-  return maximum;
-}
-
 void handleButton()
 {
+#ifdef DEBUG
   Serial.println("Button pressed!");
+#endif
   buttonPressed = true;
   lastButtonPressedMillis = millis();
 }
 
-void changeOledPage()
+void showOledPage(byte oledPageNumber)
 {
-  currentOLEDPage++;
-
-  if (currentOLEDPage >= OLED_PAGES)
+  if (oledPageNumber >= OLED_PAGES || oledPageNumber < 0)
   {
-    currentOLEDPage = 0;
+    oledPageNumber = 0;
   }
 
-  oledPages[currentOLEDPage]();
+  oledPages[oledPageNumber]();
+}
+
+void showNextOledPage()
+{
+  showOledPage(++currentOLEDPage);
 }
 
 void readSensor()
@@ -246,7 +259,7 @@ void readSensor()
     ppm = co2.readCO2UART();
     attempts--;
     delay(10);
-  } while (ppm <= 0 && attempts>0);
+  } while (ppm <= 0 && attempts > 0);
 
   for (byte i = 0; i < 99; i++)
   {
@@ -254,27 +267,6 @@ void readSensor()
   }
 
   co2History[99] = ppm;
-}
-
-void beep(int duration, int pause, int beepsCount)
-{
-  int i = 0;
-  for (i = 0; i < beepsCount; i++)
-  {
-    delay(pause);
-    digitalWrite(BOZZER, HIGH);
-    delay(duration);
-    digitalWrite(BOZZER, LOW);
-  }
-}
-
-void secondsToMS(const uint32_t seconds, uint8_t &m, uint8_t &s)
-{
-  uint32_t t = seconds;
-  s = t % 60;
-  t = (t - s) / 60;
-  m = t % 60;
-  t = (t - m) / 60;
 }
 
 void displayPreheat()
@@ -290,7 +282,9 @@ void displayPreheat()
   timeString[2] = '0' + elapsedSeconds / 10;
   timeString[3] = '0' + elapsedSeconds % 10;
 
+#ifdef DEBUG
   Serial.println(timeString);
+#endif
 
   display.clearDisplay();
   display.setTextSize(3);
