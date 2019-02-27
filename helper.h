@@ -49,7 +49,7 @@ void beep(int duration, int pause, int beepsCount, byte pin)
 
 bool isTimeSynced(NTPClient& timeClient)
 {
-  return timeClient.getEpochTime() > 0;
+  return timeClient.getEpochTime() > 1000000;
 }
 
 String getFormattedTime(unsigned long rawTime)
